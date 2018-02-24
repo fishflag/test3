@@ -1073,17 +1073,14 @@ class shader_memory_interface;
 class shader_core_mem_fetch_allocator;
 class cache_t;
 
-class ldst_unit: public pipelined_simd_unit {
+class ldst_unit: public pipelined_simd_unit 
+{
 public:
-    ldst_unit( mem_fetch_interface *icnt,
-               shader_core_mem_fetch_allocator *mf_allocator,
-               shader_core_ctx *core, 
-               opndcoll_rfu_t *operand_collector,
-               Scoreboard *scoreboard,
-               const shader_core_config *config, 
-               const memory_config *mem_config,  
-               class shader_core_stats *stats, 
-               unsigned sid, unsigned tpc );
+	ldst_unit(mem_fetch_interface *icnt, shader_core_mem_fetch_allocator *mf_allocator,
+            shader_core_ctx *core, opndcoll_rfu_t *operand_collector,
+            Scoreboard *scoreboard, const shader_core_config *config, 
+            const memory_config *mem_config, class shader_core_stats *stats, 
+            unsigned sid, unsigned tpc, bool um_enabled, mmu *page_manager, l2_tlb *L2TLB);
 
     // modifiers
     virtual void issue( register_set &inst );
@@ -1118,6 +1115,10 @@ public:
     void get_L1D_sub_stats(struct cache_sub_stats &css) const;
     void get_L1C_sub_stats(struct cache_sub_stats &css) const;
     void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+		
+		// new
+		void get_L1TLB_sub_stats(struct tlb_sub_stats &tss) const;
+		void get_L2TLB_sub_stats(struct tlb_sub_stats &tss) const;
 
 protected:
     ldst_unit( mem_fetch_interface *icnt,
@@ -1162,6 +1163,11 @@ protected:
    class shader_core_ctx *m_core;
    unsigned m_sid;
    unsigned m_tpc;
+	// used for unified memory
+	bool UM_enabled;
+	mmu *m_page_manager;
+	l1_tlb *m_L1TLB;
+ 	l2_tlb *m_L2TLB;
 
    tex_cache *m_L1T; // texture cache
    read_only_cache *m_L1C; // constant cache
@@ -1209,56 +1215,70 @@ const char* const pipeline_stage_name_decode[] = {
 
 struct shader_core_config : public core_config
 {
-    shader_core_config(){
-	pipeline_widths_string = NULL;
-    }
+	shader_core_config(){
+		pipeline_widths_string = NULL;
+  }
+  void init()
+  {
+  	int ntok = sscanf(gpgpu_shader_core_pipeline_opt, "%d:%d", 
+                      &n_thread_per_shader, &warp_size);
+   	if(ntok != 2) {
+    	printf("GPGPU-Sim uArch: error while parsing configuration 
+							string gpgpu_shader_core_pipeline_opt\n");
+    	abort();
+		}
 
-    void init()
-    {
-        int ntok = sscanf(gpgpu_shader_core_pipeline_opt,"%d:%d", 
-                          &n_thread_per_shader,
-                          &warp_size);
-        if(ntok != 2) {
-           printf("GPGPU-Sim uArch: error while parsing configuration string gpgpu_shader_core_pipeline_opt\n");
-           abort();
-	}
-
-	char* toks = new char[100];
-	char* tokd = toks;
-	strcpy(toks,pipeline_widths_string);
-
-	toks = strtok(toks,",");
-	for (unsigned i = 0; i < N_PIPELINE_STAGES; i++) { 
+		char *toks = new char[100];
+		char *tokd = toks;
+		strcpy(toks, pipeline_widths_string);
+		toks = strtok(toks, ",");
+		for (unsigned i = 0; i < N_PIPELINE_STAGES; i++) { 
 	    assert(toks);
-	    ntok = sscanf(toks,"%d", &pipe_widths[i]);
+	    ntok = sscanf(toks, "%d", &pipe_widths[i]);
 	    assert(ntok == 1); 
-	    toks = strtok(NULL,",");
-	}
-	delete[] tokd;
+	    toks = strtok(NULL, ",");
+		}
+		delete[] tokd;
 
-        if (n_thread_per_shader > MAX_THREAD_PER_SM) {
-           printf("GPGPU-Sim uArch: Error ** increase MAX_THREAD_PER_SM in abstract_hardware_model.h from %u to %u\n", 
-                  MAX_THREAD_PER_SM, n_thread_per_shader);
-           abort();
-        }
-        max_warps_per_shader =  n_thread_per_shader/warp_size;
-        assert( !(n_thread_per_shader % warp_size) );
-        max_sfu_latency = 512;
-        max_sp_latency = 32;
-        m_L1I_config.init(m_L1I_config.m_config_string,FuncCachePreferNone);
-        m_L1T_config.init(m_L1T_config.m_config_string,FuncCachePreferNone);
-        m_L1C_config.init(m_L1C_config.m_config_string,FuncCachePreferNone);
-        m_L1D_config.init(m_L1D_config.m_config_string,FuncCachePreferNone);
-        gpgpu_cache_texl1_linesize = m_L1T_config.get_line_sz();
-        gpgpu_cache_constl1_linesize = m_L1C_config.get_line_sz();
-        m_valid = true;
+    if (n_thread_per_shader > MAX_THREAD_PER_SM) {
+    	printf("GPGPU-Sim uArch: Error ** increase MAX_THREAD_PER_SM in 
+							abstract_hardware_model.h from %u to %u\n", MAX_THREAD_PER_SM, n_thread_per_shader);
+      abort();
     }
-    void reg_options(class OptionParser * opp );
-    unsigned max_cta( const kernel_info_t &k ) const;
-    unsigned num_shader() const { return n_simt_clusters*n_simt_cores_per_cluster; }
-    unsigned sid_to_cluster( unsigned sid ) const { return sid / n_simt_cores_per_cluster; }
-    unsigned sid_to_cid( unsigned sid )     const { return sid % n_simt_cores_per_cluster; }
-    unsigned cid_to_sid( unsigned cid, unsigned cluster_id ) const { return cluster_id*n_simt_cores_per_cluster + cid; }
+    max_warps_per_shader =  n_thread_per_shader/warp_size;
+    assert(!(n_thread_per_shader % warp_size));
+    max_sfu_latency = 512;
+    max_sp_latency = 32;
+    m_L1I_config.init(m_L1I_config.m_config_string, FuncCachePreferNone);
+    m_L1T_config.init(m_L1T_config.m_config_string, FuncCachePreferNone);
+    m_L1C_config.init(m_L1C_config.m_config_string, FuncCachePreferNone);
+   	m_L1D_config.init(m_L1D_config.m_config_string, FuncCachePreferNone);
+		if (UM_enabled) { // new, initilize config
+			m_L1TLB_config.init(m_L1TLB_config.m_config_string);
+			m_L2TLB_config.init(m_L2TLB_config.m_config_string);
+		}
+    gpgpu_cache_texl1_linesize = m_L1T_config.get_line_sz();
+   	gpgpu_cache_constl1_linesize = m_L1C_config.get_line_sz();
+    m_valid = true;
+	}
+  void reg_options(class OptionParser * opp);
+  unsigned max_cta(const kernel_info_t &k) const;
+ 	unsigned num_shader() const 
+	{ 
+		return n_simt_clusters * n_simt_cores_per_cluster; 
+	}
+  unsigned sid_to_cluster(unsigned sid) const 
+	{ 
+		return sid / n_simt_cores_per_cluster; 
+	}
+  unsigned sid_to_cid(unsigned sid) const 
+	{ 
+		return sid % n_simt_cores_per_cluster; 
+	}
+  unsigned cid_to_sid(unsigned cid, unsigned cluster_id) const 
+	{ 
+		return cluster_id*n_simt_cores_per_cluster + cid; 
+	}
 
 // data
     char *gpgpu_shader_core_pipeline_opt;
@@ -1280,6 +1300,10 @@ struct shader_core_config : public core_config
     mutable cache_config m_L1T_config;
     mutable cache_config m_L1C_config;
     mutable l1d_cache_config m_L1D_config;
+
+		// new for TLB config
+		l1_tlb_config m_L1TLB_config;
+		l2_tlb_config m_L2TLB_config;
 
     bool gmem_skip_L1D; // on = global memory access always skip the L1 cache 
     
@@ -1558,16 +1582,15 @@ private:
     const memory_config *m_memory_config;
 };
 
-class shader_core_ctx : public core_t {
+class shader_core_ctx : public core_t 
+{
 public:
-    // creator:
-    shader_core_ctx( class gpgpu_sim *gpu,
-                     class simt_core_cluster *cluster,
-                     unsigned shader_id,
-                     unsigned tpc_id,
-                     const struct shader_core_config *config,
-                     const struct memory_config *mem_config,
-                     shader_core_stats *stats );
+	// creator:
+	shader_core_ctx(class gpgpu_sim *gpu, class simt_core_cluster *cluster,
+                  unsigned shader_id, unsigned tpc_id,
+                  const struct shader_core_config *config,
+                  const struct memory_config *mem_config,	shader_core_stats *stats, 
+									bool um_enabled, mmu *page_manager, l2_tlb *L2TLB); // modified
 
 // used by simt_core_cluster:
     // modifiers
@@ -1614,6 +1637,8 @@ public:
     bool warp_waiting_at_mem_barrier( unsigned warp_id );
     void set_max_cta( const kernel_info_t &kernel );
     void warp_inst_complete(const warp_inst_t &inst);
+
+		void copy_access_queue(warp_inst_t &inst); // new
     
     // accessors
     std::list<unsigned> get_regs_written( const inst_t &fvt ) const;
@@ -1625,6 +1650,9 @@ public:
     void get_L1D_sub_stats(struct cache_sub_stats &css) const;
     void get_L1C_sub_stats(struct cache_sub_stats &css) const;
     void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+		
+		// new
+		void get_L1TLB_sub_stats(struct tlb_sub_stats &tss) const;
 
     void get_icnt_power_stats(long &n_simt_to_mem, long &n_mem_to_simt) const;
 
@@ -1780,7 +1808,11 @@ public:
     unsigned m_tpc; // texture processor cluster id (aka, node id when using interconnect concentration)
     const shader_core_config *m_config;
     const memory_config *m_memory_config;
-    class simt_core_cluster *m_cluster;
+    class simt_core_cluster *m_cluster;	
+		// new
+		bool UM_enabled; // new
+		mmu *page_manager; // new
+		l2_tlb *m_L2TLB; // new
 
     // statistics 
     shader_core_stats *m_stats;
@@ -1833,14 +1865,14 @@ public:
     unsigned m_dynamic_warp_id;
 };
 
-class simt_core_cluster {
+class simt_core_cluster 
+{
 public:
-    simt_core_cluster( class gpgpu_sim *gpu, 
-                       unsigned cluster_id, 
-                       const struct shader_core_config *config, 
-                       const struct memory_config *mem_config,
-                       shader_core_stats *stats,
-                       memory_stats_t *mstats );
+	simt_core_cluster(class gpgpu_sim *gpu, unsigned cluster_id, 
+										const struct shader_core_config *config, 
+                    const struct memory_config *mem_config,
+                    shader_core_stats *stats, memory_stats_t *mstats,
+										bool um_enable, mmu *page_manager, l2_tlb *L2TLB);
 
     void core_cycle();
     void icnt_cycle();
@@ -1875,6 +1907,9 @@ public:
     void get_L1D_sub_stats(struct cache_sub_stats &css) const;
     void get_L1C_sub_stats(struct cache_sub_stats &css) const;
     void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+		
+		// new
+		void get_L1TLB_sub_stats(struct tlb_sub_stats &tss) const;
 
     void get_icnt_stats(long &n_simt_to_mem, long &n_mem_to_simt) const;
 
@@ -1885,6 +1920,9 @@ private:
     shader_core_stats *m_stats;
     memory_stats_t *m_memory_stats;
     shader_core_ctx **m_core;
+		bool UM_enabled; // new
+		mmu *m_page_manager; // new
+		l2_tlb m_L2TLB; // new
 
     unsigned m_cta_issue_next_core;
     std::list<unsigned> m_core_sim_order;

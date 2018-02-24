@@ -229,7 +229,16 @@ void shader_core_config::reg_options(class OptionParser * opp)
     option_parser_register(opp, "-gmem_skip_L1D", OPT_BOOL, &gmem_skip_L1D, 
                    "global memory access skip L1D cache (implements -Xptxas -dlcm=cg, default=no skip)",
                    "0");
-
+		if (UM_enabled) {
+			option_parser_register(opp, "-gpgpu_TLB:L1", OPT_CSTR, &m_L1TLB_config.m_config_string,
+														 "per-shader L1 TLB config "
+														 "{<pgsize>:<nsets>:<assoc>:<latency>:<rep>:<mshr_entry>:<mshr_target>:<mq>:<port>}"
+														 "none");
+			option_parser_register(opp, "-gpgpu_TLB:L2", OPT_CSTR, &m_L2TLB_config.m_config_string,
+                             "shared L2 TLB config "
+                             "{<pgsize>:<nsets>:<assoc>:<latency>:<rep>:<mshr_entry>:<mshr_target>:<mq>:<port>}"
+                             "none");
+		}
     option_parser_register(opp, "-gpgpu_perfect_mem", OPT_BOOL, &gpgpu_perfect_mem, 
                  "enable perfect memory mode (no cache miss)",
                  "0");
@@ -566,10 +575,22 @@ gpgpu_sim::gpgpu_sim( const gpgpu_sim_config &config )
     gpu_tot_issued_cta = 0;
     gpu_deadlock = false;
 
+	// new
+	if (config->UM_enabled) {
+		m_page_manager = new() // To-do
+		char L2TLB_name[STRSIZE];
+		snprintf(L2TLB_name, "L2TLB");
+		m_L2TLB = new l2_tlb(L2TLB_name, config->l2_tlb_config, m_page_manager);
+	} else {
+		m_page_manager = NULL;
+		m_L2TLB = NULL;
+	}
 
-    m_cluster = new simt_core_cluster*[m_shader_config->n_simt_clusters];
-    for (unsigned i=0;i<m_shader_config->n_simt_clusters;i++) 
-        m_cluster[i] = new simt_core_cluster(this,i,m_shader_config,m_memory_config,m_shader_stats,m_memory_stats);
+	m_cluster = new simt_core_cluster*[m_shader_config->n_simt_clusters];
+  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+    	m_cluster[i] = new simt_core_cluster(this, i, m_shader_config, m_memory_config, m_shader_stats, 
+																					 m_memory_stats, config->UM_enabled, m_page_manager, m_L2TLB); // modified
+	}
 
     m_memory_partition_unit = new memory_partition_unit*[m_memory_config->m_n_mem];
     m_memory_sub_partition = new memory_sub_partition*[m_memory_config->m_n_mem_sub_partition];

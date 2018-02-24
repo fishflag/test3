@@ -337,7 +337,7 @@ private:
 class tag_array {
 public:
     // Use this constructor
-    tag_array(cache_config &config, int core_id, int type_id );
+    tag_array(cache_config &config, int core_id, int type_id);
     ~tag_array();
 
     enum cache_request_status probe( new_addr_type addr, unsigned &idx ) const;

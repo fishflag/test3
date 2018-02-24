@@ -50,6 +50,7 @@ enum mem_stage_stall_type {
    ICNT_RC_FAIL,
    COAL_STALL,
    TLB_STALL,
+	 TLB_PORT_STALL, // new
    DATA_PORT_STALL,
    WB_ICNT_RC_FAIL,
    WB_CACHE_RSRV_FAIL,
