@@ -65,15 +65,14 @@ std::list<unsigned> shader_core_ctx::get_regs_written( const inst_t &fvt ) const
    return result;
 }
 
-shader_core_ctx::shader_core_ctx( class gpgpu_sim *gpu, 
-                                  class simt_core_cluster *cluster,
-                                  unsigned shader_id,
-                                  unsigned tpc_id,
-                                  const struct shader_core_config *config,
-                                  const struct memory_config *mem_config,
-                                  shader_core_stats *stats )
-   : core_t( gpu, NULL, config->warp_size, config->n_thread_per_shader ),
-     m_barriers( this, config->max_warps_per_shader, config->max_cta_per_core, config->max_barriers_per_cta, config->warp_size ),
+shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu, class simt_core_cluster *cluster,
+                                 unsigned shader_id, unsigned tpc_id,
+                                 const struct shader_core_config *config,
+                                 const struct memory_config *mem_config, shader_core_stats *stats, 
+																 bool um_enabled, mmu *page_manager, l2_tlb *L2TLB) :
+		 core_t(gpu, NULL, config->warp_size, config->n_thread_per_shader),
+     m_barriers(this, config->max_warps_per_shader, config->max_cta_per_core, 
+								config->max_barriers_per_cta, config->warp_size),
      m_dynamic_warp_id(0)
 {
     m_cluster = cluster;
@@ -84,7 +83,12 @@ shader_core_ctx::shader_core_ctx( class gpgpu_sim *gpu,
     
     m_sid = shader_id;
     m_tpc = tpc_id;
-    
+   
+		// new
+		UM_enabled = um_enabled;
+		m_page_manager = page_manager;
+		m_L2TLB = L2TLB;
+ 
     m_pipeline_reg.reserve(N_PIPELINE_STAGES);
     for (int j = 0; j<N_PIPELINE_STAGES; j++) {
         m_pipeline_reg.push_back(register_set(m_config->pipe_widths[j],pipeline_stage_name_decode[j]));
@@ -280,8 +284,10 @@ shader_core_ctx::shader_core_ctx( class gpgpu_sim *gpu,
         m_dispatch_port.push_back(ID_OC_SFU);
         m_issue_port.push_back(OC_EX_SFU);
     }
-    
-    m_ldst_unit = new ldst_unit( m_icnt, m_mem_fetch_allocator, this, &m_operand_collector, m_scoreboard, config, mem_config, stats, shader_id, tpc_id );
+   	// create a ldst_unit 
+    m_ldst_unit = new ldst_unit(m_icnt, m_mem_fetch_allocator, this, &m_operand_collector, 
+																m_scoreboard, config, mem_config, stats, shader_id, tpc_id, 
+																UM_enabled, m_page_manager, m_L2TLB); // modified
     m_fu.push_back(m_ldst_unit);
     m_dispatch_port.push_back(ID_OC_MEM);
     m_issue_port.push_back(OC_EX_MEM);
@@ -676,6 +682,14 @@ void shader_core_ctx::func_exec_inst( warp_inst_t &inst )
         inst.generate_mem_accesses();
 }
 
+// new
+void shader_core_ctx::copy_access_queue(warp_inst_t &inst)
+{
+		if (!inst.accessq_empty()) {
+			inst.accessqTLB_copy();
+		}
+}
+
 void shader_core_ctx::issue_warp( register_set& pipe_reg_set, const warp_inst_t* next_inst, const active_mask_t &active_mask, unsigned warp_id )
 {
     warp_inst_t** pipe_reg = pipe_reg_set.get_free();
@@ -687,6 +701,9 @@ void shader_core_ctx::issue_warp( register_set& pipe_reg_set, const warp_inst_t*
     (*pipe_reg)->issue( active_mask, warp_id, gpu_tot_sim_cycle + gpu_sim_cycle, m_warp[warp_id].get_dynamic_warp_id() ); // dynamic instruction information
     m_stats->shader_cycle_distro[2+(*pipe_reg)->active_count()]++;
     func_exec_inst( **pipe_reg );
+		if (UM_enabled) { // new
+			copy_access_queue(**pipe_reg);
+		}
     if( next_inst->op == BARRIER_OP ){
     	m_warp[warp_id].store_info_of_last_inst_at_barrier(*pipe_reg);
         m_barriers.warp_reaches_barrier(m_warp[warp_id].get_cta_id(),warp_id,const_cast<warp_inst_t*> (next_inst));
@@ -1202,6 +1219,16 @@ void ldst_unit::get_L1T_sub_stats(struct cache_sub_stats &css) const{
         m_L1T->get_sub_stats(css);
 }
 
+// new
+void ldst_unit::get_L1TLB_sub_stats(struct tlb_sub_stats &tss) const
+{
+	m_L1TLB->get_sub_stats(tss);
+}
+void ldst_unit::get_L2TLB_sub_stats(struct tlb_sub_stats &tss) const
+{
+  m_L2TLB->get_sub_stats(tss);
+}
+
 void shader_core_ctx::warp_inst_complete(const warp_inst_t &inst)
 {
    #if 0
@@ -1287,60 +1314,113 @@ bool ldst_unit::shared_cycle( warp_inst_t &inst, mem_stage_stall_type &rc_fail, 
    return !stall; 
 }
 
-mem_stage_stall_type
-ldst_unit::process_cache_access( cache_t* cache,
-                                 new_addr_type address,
-                                 warp_inst_t &inst,
-                                 std::list<cache_event>& events,
-                                 mem_fetch *mf,
-                                 enum cache_request_status status )
+mem_stage_stall_type ldst_unit::process_cache_access(cache_t* cache,
+                                new_addr_type address, warp_inst_t &inst,
+                                std::list<cache_event>& events,
+                                mem_fetch *mf, enum cache_request_status status)
 {
-    mem_stage_stall_type result = NO_RC_FAIL;
-    bool write_sent = was_write_sent(events);
-    bool read_sent = was_read_sent(events);
-    if( write_sent ) 
-        m_core->inc_store_req( inst.warp_id() );
-    if ( status == HIT ) {
-        assert( !read_sent );
-        inst.accessq_pop_back();
-        if ( inst.is_load() ) {
-            for ( unsigned r=0; r < 4; r++)
-                if (inst.out[r] > 0)
-                    m_pending_writes[inst.warp_id()][inst.out[r]]--; 
-        }
-        if( !write_sent ) 
-            delete mf;
-    } else if ( status == RESERVATION_FAIL ) {
-        result = COAL_STALL;
-        assert( !read_sent );
-        assert( !write_sent );
-        delete mf;
-    } else {
-        assert( status == MISS || status == HIT_RESERVED );
-        //inst.clear_active( access.get_warp_mask() ); // threads in mf writeback when mf returns
-        inst.accessq_pop_back();
+	mem_stage_stall_type result = NO_RC_FAIL;
+  bool write_sent = was_write_sent(events);
+  bool read_sent = was_read_sent(events);
+  if(write_sent) {
+  	m_core->inc_store_req(inst.warp_id());
+	}
+  if (status == HIT) {
+  	assert(!read_sent);
+    inst.accessq_pop_back();
+    if (inst.is_load()) {
+    	for (unsigned r = 0; r < 4; r++) {
+      	if (inst.out[r] > 0) {
+        	m_pending_writes[inst.warp_id()][inst.out[r]]--; 
+				}
+			}
     }
-    if( !inst.accessq_empty() )
-        result = BK_CONF;
-    return result;
+    if(!write_sent) {
+    	delete mf;
+		}
+	} else if (status == RESERVATION_FAIL) {
+  	result = COAL_STALL;
+    assert(!read_sent);
+    assert(!write_sent);
+		if (!UM_enabled) { // new
+    	delete mf;
+		} 
+  } else {
+    assert(status == MISS || status == HIT_RESERVED);
+    //inst.clear_active( access.get_warp_mask() ); // threads in mf writeback when mf returns
+    inst.accessq_pop_back();
+  }
+  if(!inst.accessq_empty())
+  	result = BK_CONF;
+
+  return result;
 }
 
-mem_stage_stall_type ldst_unit::process_memory_access_queue( cache_t *cache, warp_inst_t &inst )
+mem_stage_stall_type ldst_unit::process_memory_access_queue(cache_t *cache, warp_inst_t &inst)
 {
-    mem_stage_stall_type result = NO_RC_FAIL;
-    if( inst.accessq_empty() )
-        return result;
+	mem_stage_stall_type result = NO_RC_FAIL;
+  if(inst.accessq_empty())
+  	return result;
 
-    if( !cache->data_port_free() ) 
-        return DATA_PORT_STALL; 
+  if(!cache->data_port_free()) 
+  	return DATA_PORT_STALL; 
 
-    //const mem_access_t &access = inst.accessq_back();
-    mem_fetch *mf = m_mf_allocator->alloc(inst,inst.accessq_back());
-    std::list<cache_event> events;
-    enum cache_request_status status = cache->access(mf->get_addr(),mf,gpu_sim_cycle+gpu_tot_sim_cycle,events);
-    return process_cache_access( cache, mf->get_addr(), inst, events, mf, status );
+  mem_fetch *mf = m_mf_allocator->alloc(inst, inst.accessq_back());
+  std::list<cache_event> events;
+  enum cache_request_status status = cache->access(mf->get_addr(), mf, 
+																									 gpu_sim_cycle + gpu_tot_sim_cycle, events);
+  return process_cache_access(cache, mf->get_addr(), inst, events, mf, status);
 }
 
+// new, process TLB request
+mem_stage_stall_type ldst_unit::process_LlTLB_access(l1_tlb *L1TLB, warp_inst_t &inst)
+{
+	mem_stage_stall_type result = NO_RC_FAIL;
+	if (inst.accessqTLB_empty()) {
+		return result;
+	}
+	if (!L1TLB->data_port_free()) {
+		return TLB_PORT_STALL;
+	}
+
+	mem_fetch *mf = m_mf_allocator->alloc(inst, inst.accessqTLB_back());
+	enum tlb_request_status status = m_L1TLB->process_access(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
+	if (status == HIT) {
+		inst.accessqTLB_pop_back();
+	} else if (status == RESERVATION_FAIL) {
+		result = TLB_STALL;
+		delete mf;
+	} else {
+		assert(status == MISS || status == HIT_RESERVED);
+		inst.accessqTLB_pop_back();
+	}
+	
+	return result;
+}
+
+// new with TLB
+mem_stage_stall_type ldst_unit::process_memory_access_queue(cache_t *cache, l1_tlb *tlb, warp_inst_t &inst)
+{
+	mem_stage_stall_type result = NO_RC_FAIL;
+	if (inst.accessq_empty()) {
+		return result;
+	}
+	if (!cache->data_port_free()) {
+		return DATA_PORT_STALL;
+	}
+	if (!tlb->m_response_queue.empty()) {
+		mem_fetch *mf = tlb->m_response_queue.front();
+		std::list<cache_event> events;
+		enum cache_request_status status = cache->access(mf->get_addr(), mf, 
+																									   gpu_sim_cycle + gpu_tot_sim_cycle, events);
+		if (status != RESERVATION_FAIL) {
+			tlb->m_response_queue.pop_front();
+		}	
+		return process_cache_access(cache, mf->get_addr(), inst, events, mf, status);
+	}
+	return result;
+}
+		
 bool ldst_unit::constant_cycle( warp_inst_t &inst, mem_stage_stall_type &rc_fail, mem_stage_access_type &fail_type)
 {
    if( inst.empty() || ((inst.space.get_type() != const_space) && (inst.space.get_type() != param_space_kernel)) )
@@ -1372,61 +1452,82 @@ bool ldst_unit::texture_cycle( warp_inst_t &inst, mem_stage_stall_type &rc_fail,
    return inst.accessq_empty(); //done if empty.
 }
 
-bool ldst_unit::memory_cycle( warp_inst_t &inst, mem_stage_stall_type &stall_reason, mem_stage_access_type &access_type )
+bool ldst_unit::memory_cycle(warp_inst_t &inst, mem_stage_stall_type &stall_reason, 
+														 mem_stage_access_type &access_type)
 {
-   if( inst.empty() || 
-       ((inst.space.get_type() != global_space) &&
-        (inst.space.get_type() != local_space) &&
-        (inst.space.get_type() != param_space_local)) ) 
-       return true;
-   if( inst.active_count() == 0 ) 
-       return true;
-   assert( !inst.accessq_empty() );
-   mem_stage_stall_type stall_cond = NO_RC_FAIL;
-   const mem_access_t &access = inst.accessq_back();
+	if(inst.empty() || ((inst.space.get_type() != global_space) &&
+    (inst.space.get_type() != local_space) &&
+    (inst.space.get_type() != param_space_local))) { 
+  	return true;
+	}
+  if(inst.active_count() == 0) 
+  	return true;
+  assert(!inst.accessq_empty());
+  mem_stage_stall_type stall_cond = NO_RC_FAIL;
+  const mem_access_t &access = inst.accessq_back();
 
-   bool bypassL1D = false; 
-   if ( CACHE_GLOBAL == inst.cache_op || (m_L1D == NULL) ) {
-       bypassL1D = true; 
-   } else if (inst.space.is_global()) { // global memory access 
-       // skip L1 cache if the option is enabled
-       if (m_core->get_config()->gmem_skip_L1D) 
-           bypassL1D = true; 
-   }
+  bool bypassL1D = false; 
+  if (CACHE_GLOBAL == inst.cache_op || (m_L1D == NULL)) {
+  	bypassL1D = true; 
+  } else if (inst.space.is_global()) { // global memory access 
+  	// skip L1 cache if the option is enabled
+    if (m_core->get_config()->gmem_skip_L1D) 
+    	bypassL1D = true; 
+  }
 
-   if( bypassL1D ) {
-       // bypass L1 cache
-       unsigned control_size = inst.is_store() ? WRITE_PACKET_SIZE : READ_PACKET_SIZE;
-       unsigned size = access.get_size() + control_size;
-       if( m_icnt->full(size, inst.is_store() || inst.isatomic()) ) {
-           stall_cond = ICNT_RC_FAIL;
-       } else {
-           mem_fetch *mf = m_mf_allocator->alloc(inst,access);
-           m_icnt->push(mf);
-           inst.accessq_pop_back();
-           //inst.clear_active( access.get_warp_mask() );
-           if( inst.is_load() ) { 
-              for( unsigned r=0; r < 4; r++) 
-                  if(inst.out[r] > 0) 
-                      assert( m_pending_writes[inst.warp_id()][inst.out[r]] > 0 );
-           } else if( inst.is_store() ) 
-              m_core->inc_store_req( inst.warp_id() );
-       }
-   } else {
-       assert( CACHE_UNDEFINED != inst.cache_op );
-       stall_cond = process_memory_access_queue(m_L1D,inst);
-   }
-   if( !inst.accessq_empty() ) 
-       stall_cond = COAL_STALL;
-   if (stall_cond != NO_RC_FAIL) {
-      stall_reason = stall_cond;
-      bool iswrite = inst.is_store();
-      if (inst.space.is_local()) 
-         access_type = (iswrite)?L_MEM_ST:L_MEM_LD;
+  if(bypassL1D) {
+  	// bypass L1 cache
+    unsigned control_size = inst.is_store() ? WRITE_PACKET_SIZE : READ_PACKET_SIZE;
+    unsigned size = access.get_size() + control_size;
+    if(m_icnt->full(size, inst.is_store() || inst.isatomic())) {
+    	stall_cond = ICNT_RC_FAIL;
+    } else {
+    	mem_fetch *mf = m_mf_allocator->alloc(inst, access);
+      m_icnt->push(mf);
+      inst.accessq_pop_back();
+      //inst.clear_active( access.get_warp_mask() );
+      if(inst.is_load()) { 
+      	for(unsigned r = 0; r < 4; r++) { 
+        	if(inst.out[r] > 0) {
+          	assert(m_pending_writes[inst.warp_id()][inst.out[r]] > 0);
+					}
+				}
+      } else if(inst.is_store()) { 
+      	m_core->inc_store_req(inst.warp_id());
+      }
+	} else if (UM_enabled) {
+  	assert(CACHE_UNDEFINED != inst.cache_op);
+		assert(m_page_manager && m_L1TLB && m_L2TLB);
+		mem_stage_stall_type tlb_stall;
+		// TLB process
+		stall_cond = process_memory_access_queue(m_L1D, m_L1TLB, inst);
+		m_L2TLB->writeback();
+		m_L2TLB->fill(gpu_sim_cycle + tot_gpu_sim_cycle);
+		m_L2TLB->cycle();
+		m_L2TLB->process_access(gpu_sim_cycle + tot_gpu_sim_cycle);
+		m_L1TLB->writeback();
+		m_L1TLB->fill(gpu_sim_cycle + tot_gpu_sim_cycle);
+		m_L1TLB->cycle();
+		tlb_stall = process_LlTLB_access(m_L1TLB, inst);
+		if (tlb_stall != NO_RC_FAIL) {
+			m_stats->gpgpu_n_stall_shd_mem++;
+		}
+		//stall_cond = process_memory_access_queue(m_L1D, m_L1TLB, inst);
+  } else {
+		assert(CACHE_UNDEFINED != inst.cache_op);
+		stall_cond = process_memory_access_queue(m_L1D, inst);
+	}
+	if (!inst.accessq_empty()) 
+		stall_cond = COAL_STALL;
+  if (stall_cond != NO_RC_FAIL) {
+  	stall_reason = stall_cond;
+    bool iswrite = inst.is_store();
+    if (inst.space.is_local()) 
+    	access_type = (iswrite)? L_MEM_ST: L_MEM_LD;
       else 
-         access_type = (iswrite)?G_MEM_ST:G_MEM_LD;
-   }
-   return inst.accessq_empty(); 
+      access_type = (iswrite)? G_MEM_ST: G_MEM_LD;
+  }
+  return inst.accessq_empty(); 
 }
 
 
@@ -1552,16 +1653,11 @@ void pipelined_simd_unit::issue( register_set& source_reg )
     }
 */
 
-void ldst_unit::init( mem_fetch_interface *icnt,
-                      shader_core_mem_fetch_allocator *mf_allocator,
-                      shader_core_ctx *core, 
-                      opndcoll_rfu_t *operand_collector,
-                      Scoreboard *scoreboard,
-                      const shader_core_config *config,
-                      const memory_config *mem_config,  
-                      shader_core_stats *stats,
-                      unsigned sid,
-                      unsigned tpc )
+void ldst_unit::init(mem_fetch_interface *icnt, shader_core_mem_fetch_allocator *mf_allocator,
+                     shader_core_ctx *core, opndcoll_rfu_t *operand_collector,
+                     Scoreboard *scoreboard, const shader_core_config *config,
+                     const memory_config *mem_config, shader_core_stats *stats,
+                     unsigned sid, unsigned tpc)
 {
     m_memory_config = mem_config;
     m_icnt = icnt;
@@ -1589,38 +1685,32 @@ void ldst_unit::init( mem_fetch_interface *icnt,
 }
 
 
-ldst_unit::ldst_unit( mem_fetch_interface *icnt,
-                      shader_core_mem_fetch_allocator *mf_allocator,
-                      shader_core_ctx *core, 
-                      opndcoll_rfu_t *operand_collector,
-                      Scoreboard *scoreboard,
-                      const shader_core_config *config,
-                      const memory_config *mem_config,  
-                      shader_core_stats *stats,
-                      unsigned sid,
-                      unsigned tpc ) : pipelined_simd_unit(NULL,config,3,core), m_next_wb(config)
+ldst_unit::ldst_unit(mem_fetch_interface *icnt, shader_core_mem_fetch_allocator *mf_allocator,
+                     shader_core_ctx *core, opndcoll_rfu_t *operand_collector, Scoreboard *scoreboard,
+                     const shader_core_config *config, const memory_config *mem_config,  
+                     shader_core_stats *stats, unsigned sid, unsigned tpc, 
+										 bool um_enabled, mmu *page_manager, l2_tlb *L2TLB) :
+										 pipelined_simd_unit(NULL, config, 3, core), m_next_wb(config)
 {
-    init( icnt,
-          mf_allocator,
-          core, 
-          operand_collector,
-          scoreboard,
-          config, 
-          mem_config,  
-          stats, 
-          sid,
-          tpc );
-    if( !m_config->m_L1D_config.disabled() ) {
-        char L1D_name[STRSIZE];
-        snprintf(L1D_name, STRSIZE, "L1D_%03d", m_sid);
-        m_L1D = new l1_cache( L1D_name,
-                              m_config->m_L1D_config,
-                              m_sid,
-                              get_shader_normal_cache_id(),
-                              m_icnt,
-                              m_mf_allocator,
-                              IN_L1D_MISS_QUEUE );
-    }
+	init(icnt, mf_allocator, core, operand_collector,
+			 scoreboard, config, mem_config, stats, sid, tpc);
+	// new
+	UM_enabled = um_enabled;
+	m_page_manager = page_manager;
+	m_L2TLB = L2TLB;
+	if (UM_enabled) {
+		char L1TLB_name[STRSIZE];
+		snprintf(L1TLB_name, STRSIZE, "L1TLB_%03d", m_sid);
+		m_L1TLB = new l1_tlb(L1TLB_name, m_config->m_L1TLB_config, m_sid, m_L2TLB);
+	}
+		
+  if (!m_config->m_L1D_config.disabled()) {
+  	char L1D_name[STRSIZE];
+    snprintf(L1D_name, STRSIZE, "L1D_%03d", m_sid);
+    m_L1D = new l1_cache(L1D_name, m_config->m_L1D_config, m_sid,
+                         get_shader_normal_cache_id(), m_icnt,
+                         m_mf_allocator, IN_L1D_MISS_QUEUE);
+	}
 }
 
 ldst_unit::ldst_unit( mem_fetch_interface *icnt,
@@ -2006,7 +2096,41 @@ void gpgpu_sim::shader_print_cache_stats( FILE *fout ) const{
     // L1I
     struct cache_sub_stats total_css;
     struct cache_sub_stats css;
-
+		
+		if (UM_enabled) { // new
+			struct tlb_sub_stats total_tss;
+			struct tlb_sub_stats tss;
+			total_tss.clear();
+			tss.clear();
+			fprintf(fout, "\n============TLB stats===========\n");
+			fprintf(fout, "L1_TLB:\n");
+			for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+				m_cluster[i]->get_L1TLB_sub_stats(tss);
+				fprintf(stdout, "\tL1TLB_core[%d]: Access = %d, Miss = %d, Miss_rate = %.3lf, 
+								Pending_hits = %u, Reservation_fails = %u\n", i, tss.accesses, tss.misses, 
+								(double)tss.misses / (double)tss.accesses, tss.pending_hits, tss.res_fails);
+				total_tss += tss;
+			}
+			fprintf(fout, "\tL1TLB_total_accesses = %u\n", total_tss.accesses);
+      fprintf(fout, "\tL1TLB_total_misses = %u\n", total_tss.misses);
+      if(total_tss.accesses > 0) {
+      	fprintf(fout, "\tL1TLB_total_miss_rate = %.4lf\n", (double)total_tss.misses / (double)total_tss.accesses);
+      }
+      fprintf(fout, "\tL1TLB_total_pending_hits = %u\n", total_tss.pending_hits);
+      fprintf(fout, "\tL1TLB_total_reservation_fails = %u\n", total_tss.res_fails);
+			// print L2 TLB stats
+			fprintf(fout, "L2_TLB:\n");
+			tss.clear();
+			get_L2TLB_sub_stats(tss)
+			fprintf(fout, "\tL2TLB_total_accesses = %u\n", tss.accesses);
+      fprintf(fout, "\tL2TLB_total_misses = %u\n", tss.misses);
+      if(tss.accesses > 0) {
+        fprintf(fout, "\tL2TLB_total_miss_rate = %.4lf\n", (double)tss.misses / (double)tss.accesses);
+      }
+      fprintf(fout, "\tL2TLB_total_pending_hits = %u\n", tss.pending_hits);
+      fprintf(fout, "\tL2TLB_total_reservation_fails = %u\n", tss.res_fails);
+	}
+			
     if(!m_shader_config->m_L1I_config.disabled()){
         total_css.clear();
         css.clear();
@@ -2830,6 +2954,12 @@ void shader_core_ctx::get_L1T_sub_stats(struct cache_sub_stats &css) const{
     m_ldst_unit->get_L1T_sub_stats(css);
 }
 
+// new
+void shader_core_ctx::get_L1TLB_sub_stats(struct tlb_sub_stats &tss) const
+{
+	m_ldst_unit->get_L1TLB_sub_stats(tss);
+}
+
 void shader_core_ctx::get_icnt_power_stats(long &n_simt_to_mem, long &n_mem_to_simt) const{
 	n_simt_to_mem += m_stats->n_simt_to_mem[m_sid];
 	n_mem_to_simt += m_stats->n_mem_to_simt[m_sid];
@@ -3151,25 +3281,30 @@ void opndcoll_rfu_t::collector_unit_t::dispatch()
       m_src_op[i].reset();
 }
 
-simt_core_cluster::simt_core_cluster( class gpgpu_sim *gpu, 
-                                      unsigned cluster_id, 
-                                      const struct shader_core_config *config, 
-                                      const struct memory_config *mem_config,
-                                      shader_core_stats *stats, 
-                                      class memory_stats_t *mstats )
+simt_core_cluster::simt_core_cluster(class gpgpu_sim *gpu, unsigned cluster_id, 
+                                     const struct shader_core_config *config, 
+                                     const struct memory_config *mem_config,
+                                     shader_core_stats *stats, class memory_stats_t *mstatsi
+																		 bool um_enabled, mmu *page_manager, l2_tlb *L2TLB)
 {
-    m_config = config;
-    m_cta_issue_next_core=m_config->n_simt_cores_per_cluster-1; // this causes first launch to use hw cta 0
-    m_cluster_id=cluster_id;
-    m_gpu = gpu;
-    m_stats = stats;
-    m_memory_stats = mstats;
-    m_core = new shader_core_ctx*[ config->n_simt_cores_per_cluster ];
-    for( unsigned i=0; i < config->n_simt_cores_per_cluster; i++ ) {
-        unsigned sid = m_config->cid_to_sid(i,m_cluster_id);
-        m_core[i] = new shader_core_ctx(gpu,this,sid,m_cluster_id,config,mem_config,stats);
-        m_core_sim_order.push_back(i); 
-    }
+	m_config = config;
+	// this causes first launch to use hw cta 0
+  m_cta_issue_next_core = m_config->n_simt_cores_per_cluster - 1; 
+  m_cluster_id = cluster_id;
+  m_gpu = gpu;
+  m_stats = stats;
+  m_memory_stats = mstats;
+	// new
+	UM_enabled = um_enabled;
+	m_page_manager = page_manager;
+	m_L2TLB = L2TLB;
+  m_core = new shader_core_ctx*[config->n_simt_cores_per_cluster];
+  for(unsigned i = 0; i < config->n_simt_cores_per_cluster; i++) {
+  	unsigned sid = m_config->cid_to_sid(i, m_cluster_id);
+    m_core[i] = new shader_core_ctx(gpu, this, sid, m_cluster_id, config, mem_config, 
+																		stats, UM_enabled, m_page_manager, m_L2TLB);
+    m_core_sim_order.push_back(i); 
+  }
 }
 
 void simt_core_cluster::core_cycle()
@@ -3402,6 +3537,21 @@ void simt_core_cluster::get_L1D_sub_stats(struct cache_sub_stats &css) const{
     }
     css = total_css;
 }
+
+// new
+void simt_core_cluster::get_L1TLB_sub_stats(struct cache_sub_stats &tss) const
+{
+	struct tlb_sub_stats temp_tss;
+  struct tlb_sub_stats total_tss;
+  temp_tss.clear();
+  total_tss.clear();
+  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; ++i) {
+  	m_core[i]->get_L1TLB_sub_stats(temp_tss);
+    total_tss += temp_tss;
+  }
+  tss = total_tss;
+}
+
 void simt_core_cluster::get_L1C_sub_stats(struct cache_sub_stats &css) const{
     struct cache_sub_stats temp_css;
     struct cache_sub_stats total_css;

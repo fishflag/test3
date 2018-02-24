@@ -93,6 +93,24 @@ public:
    bool isconst() const;
    enum mf_type get_type() const { return m_type; }
    bool isatomic() const;
+	
+	// new
+	void set_va(new_addr_type va)
+	{
+		m_access.set_va(va);
+	}
+	void set_pa(new_addr_type pa)
+	{
+		m_access.set_pa(pa);
+	}
+	new_addr_type get_va() const
+	{
+		m_access.get_va();
+	}
+	new_addr_type get_pa() const
+	{
+		m_access.get_pa();
+	}
 
    void set_return_timestamp( unsigned t ) { m_timestamp2=t; }
    void set_icnt_receive_time( unsigned t ) { m_icnt_receive_time=t; }

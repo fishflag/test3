@@ -644,6 +644,24 @@ public:
    bool is_write() const { return m_write; }
    enum mem_access_type get_type() const { return m_type; }
    mem_access_byte_mask_t get_byte_mask() const { return m_byte_mask; }
+	
+	// new
+	void set_va(new_addr_type va)
+	{
+		m_va = va;
+	}
+	void set_pa(new_addr_type pa)
+	{
+		m_pa = pa;
+	}
+	new_addr_type get_va() const
+	{
+		return m_va;
+	}
+	new_addr_type get_pa() const
+	{
+		return m_pa;
+	}
 
    void print(FILE *fp) const
    {
@@ -677,7 +695,9 @@ private:
    mem_access_type m_type;
    active_mask_t m_warp_mask;
    mem_access_byte_mask_t m_byte_mask;
-
+	
+	new_addr_type m_va; // new
+	new_addr_type m_pa; // new
    static unsigned sm_next_access_uid;
 };
 
@@ -949,6 +969,34 @@ public:
     unsigned accessq_count() const { return m_accessq.size(); }
     const mem_access_t &accessq_back() { return m_accessq.back(); }
     void accessq_pop_back() { m_accessq.pop_back(); }
+		// new
+		bool accessqTLB_empty() const
+		{
+			return m_accessqTLB.empty();
+		}
+		unsigned accessqTLB_count() const
+		{
+			return m_accessqTLB.size();
+		}
+		const mem_access_t& accessq_back()
+		{
+			return m_accessqTLB.back();
+		}
+		void accessqTLB_pop_back()
+		{
+			m_accessqTLB.pop_back();
+		}
+		/*void accessqTLB_push_back(mem_access_t access)
+		{
+			m_accessqTLB.push_back(access);
+		}*/
+		void accessqTLB_copy()
+		{
+			list<mem_access_t>::iterator iter;
+			for (iter = m_accessq.begin(); iter != m_accessq.end(); iter++)	{
+				m_accessqTLB.push_back(*iter);
+			}
+		}
 
     bool dispatch_delay()
     { 
@@ -992,6 +1040,7 @@ protected:
     std::vector<per_thread_info> m_per_scalar_thread;
     bool m_mem_accesses_created;
     std::list<mem_access_t> m_accessq;
+		std::list<mem_access_t> m_accessqTLB; // new, used in unified memory
 
     static unsigned sm_next_uid;
 };
